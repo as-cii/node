@@ -179,6 +179,9 @@ static int v8_thread_pool_size = v8_default_thread_pool_size;
 static bool prof_process = false;
 static bool v8_is_profiling = false;
 static bool node_is_initialized = false;
+
+static Mutex dlopen_mutex;
+static std::map<std::string, node_module*> dlopen_modules_by_filename;
 static node_module* modpending;
 static node_module* modlist_builtin;
 static node_module* modlist_internal;
@@ -2651,10 +2654,6 @@ node_module* get_linked_module(const char* name) {
 // cache that's a plain C list or hash table that's shared across contexts?
 static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
-  uv_lib_t lib;
-
-  CHECK_EQ(modpending, nullptr);
-
   if (args.Length() != 2) {
     env->ThrowError("process.dlopen takes exactly 2 arguments.");
     return;
@@ -2662,62 +2661,84 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
 
   Local<Object> module = args[0]->ToObject(env->isolate());  // Cast
   node::Utf8Value filename(env->isolate(), args[1]);  // Cast
-  const bool is_dlopen_error = uv_dlopen(*filename, &lib);
+  std::string filename_string(*filename);
+  node_module* mp = nullptr;
 
-  // Objects containing v14 or later modules will have registered themselves
-  // on the pending list.  Activate all of them now.  At present, only one
-  // module per object is supported.
-  node_module* const mp = modpending;
-  modpending = nullptr;
+  {
+    Mutex::ScopedLock scoped_lock(dlopen_mutex);
 
-  if (is_dlopen_error) {
-    Local<String> errmsg = OneByteString(env->isolate(), uv_dlerror(&lib));
-    uv_dlclose(&lib);
-#ifdef _WIN32
-    // Windows needs to add the filename into the error message
-    errmsg = String::Concat(errmsg, args[1]->ToString(env->isolate()));
-#endif  // _WIN32
-    env->isolate()->ThrowException(Exception::Error(errmsg));
-    return;
-  }
+    auto previously_loaded_module = dlopen_modules_by_filename.find(filename_string);
+    if (previously_loaded_module != dlopen_modules_by_filename.end()) {
+      mp = previously_loaded_module->second;
+    } else {
+      uv_lib_t lib;
+      CHECK_EQ(modpending, nullptr);
+      const bool is_dlopen_error = uv_dlopen(*filename, &lib);
 
-  if (mp == nullptr) {
-    uv_dlclose(&lib);
-    env->ThrowError("Module did not self-register.");
-    return;
-  }
-  if (mp->nm_version == -1) {
-    if (env->EmitNapiWarning()) {
-      ProcessEmitWarning(env, "N-API is an experimental feature and could "
-                         "change at any time.");
+      // Objects containing v14 or later modules will have registered themselves
+      // on the pending list.  Activate all of them now.  At present, only one
+      // module per object is supported.
+      mp = modpending;
+      modpending = nullptr;
+
+      if (is_dlopen_error) {
+        Local<String> errmsg = OneByteString(env->isolate(), uv_dlerror(&lib));
+        uv_dlclose(&lib);
+    #ifdef _WIN32
+        // Windows needs to add the filename into the error message
+        errmsg = String::Concat(errmsg, args[1]->ToString(env->isolate()));
+    #endif  // _WIN32
+        env->isolate()->ThrowException(Exception::Error(errmsg));
+        return;
+      }
+
+      if (mp == nullptr) {
+        uv_dlclose(&lib);
+        env->ThrowError("Module did not self-register.");
+        return;
+      }
+      if (mp->nm_version == -1) {
+        if (env->EmitNapiWarning()) {
+          ProcessEmitWarning(env, "N-API is an experimental feature and could "
+                             "change at any time.");
+        }
+      } else if (mp->nm_version != NODE_MODULE_VERSION) {
+        char errmsg[1024];
+        snprintf(errmsg,
+                 sizeof(errmsg),
+                 "The module '%s'"
+                 "\nwas compiled against a different Node.js version using"
+                 "\nNODE_MODULE_VERSION %d. This version of Node.js requires"
+                 "\nNODE_MODULE_VERSION %d. Please try re-compiling or "
+                 "re-installing\nthe module (for instance, using `npm rebuild` "
+                 "or `npm install`).",
+                 *filename, mp->nm_version, NODE_MODULE_VERSION);
+
+        // NOTE: `mp` is allocated inside of the shared library's memory, calling
+        // `uv_dlclose` will deallocate it
+        uv_dlclose(&lib);
+        env->ThrowError(errmsg);
+        return;
+      }
+      if (mp->nm_flags & NM_F_BUILTIN) {
+        uv_dlclose(&lib);
+        env->ThrowError("Built-in module self-registered.");
+        return;
+      }
+
+      mp->nm_dso_handle = lib.handle;
+      mp->nm_link = modlist_addon;
+      modlist_addon = mp;
+
+      if (mp->nm_context_register_func == nullptr && mp->nm_register_func != nullptr) {
+        uv_dlclose(&lib);
+        env->ThrowError("Module has no declared entry point.");
+        return;
+      }
+
+      dlopen_modules_by_filename.insert(std::make_pair(filename_string, mp));
     }
-  } else if (mp->nm_version != NODE_MODULE_VERSION) {
-    char errmsg[1024];
-    snprintf(errmsg,
-             sizeof(errmsg),
-             "The module '%s'"
-             "\nwas compiled against a different Node.js version using"
-             "\nNODE_MODULE_VERSION %d. This version of Node.js requires"
-             "\nNODE_MODULE_VERSION %d. Please try re-compiling or "
-             "re-installing\nthe module (for instance, using `npm rebuild` "
-             "or `npm install`).",
-             *filename, mp->nm_version, NODE_MODULE_VERSION);
-
-    // NOTE: `mp` is allocated inside of the shared library's memory, calling
-    // `uv_dlclose` will deallocate it
-    uv_dlclose(&lib);
-    env->ThrowError(errmsg);
-    return;
   }
-  if (mp->nm_flags & NM_F_BUILTIN) {
-    uv_dlclose(&lib);
-    env->ThrowError("Built-in module self-registered.");
-    return;
-  }
-
-  mp->nm_dso_handle = lib.handle;
-  mp->nm_link = modlist_addon;
-  modlist_addon = mp;
 
   Local<String> exports_string = env->exports_string();
   Local<Object> exports = module->Get(exports_string)->ToObject(env->isolate());
@@ -2726,10 +2747,6 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
     mp->nm_context_register_func(exports, module, env->context(), mp->nm_priv);
   } else if (mp->nm_register_func != nullptr) {
     mp->nm_register_func(exports, module, mp->nm_priv);
-  } else {
-    uv_dlclose(&lib);
-    env->ThrowError("Module has no declared entry point.");
-    return;
   }
 
   // Tell coverity that 'handle' should not be freed when we return.
